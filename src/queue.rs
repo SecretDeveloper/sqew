@@ -67,8 +67,127 @@ pub enum MessageCommands {
 
 /// Execute a queue command
 use crate::db;
+// Re-export initialization functions
+pub use crate::db::{init_pool, create_db_if_needed};
 use crate::models::Queue;
 use anyhow::{Context, Result, anyhow};
+use sqlx::SqlitePool;
+use crate::models::Message;
+
+// Service-level queue operations, wrapping the DB layer
+/// List all queues
+pub async fn list_queues_service(pool: &SqlitePool) -> Result<Vec<Queue>> {
+    db::list_queues(pool)
+        .await
+        .context("Failed to list queues")
+}
+
+/// Create a new queue, return the created Queue
+pub async fn create_queue_service(
+    pool: &SqlitePool,
+    name: &str,
+    max_attempts: i32,
+    visibility_ms: i32,
+) -> Result<Queue> {
+    if db::get_queue_by_name(pool, name)
+        .await?
+        .is_some() {
+        return Err(anyhow!("Queue '{}' already exists", name));
+    }
+    db::create_queue(pool, name, None, max_attempts, visibility_ms)
+        .await
+        .context("Failed to create queue")?;
+    let q = db::get_queue_by_name(pool, name)
+        .await
+        .context("Failed to fetch created queue")?
+        .ok_or_else(|| anyhow!("Queue '{}' not found after creation", name))?;
+    Ok(q)
+}
+
+/// Delete a queue by name. Returns true if a queue was deleted
+pub async fn delete_queue_service(pool: &SqlitePool, name: &str) -> Result<bool> {
+    let deleted = db::delete_queue_by_name(pool, name)
+        .await
+        .context("Failed to delete queue")?;
+    Ok(deleted > 0)
+}
+
+/// Show a queue by name
+pub async fn show_queue_service(pool: &SqlitePool, name: &str) -> Result<Queue> {
+    let q = db::get_queue_by_name(pool, name)
+        .await
+        .context("Failed to fetch queue")?
+        .ok_or_else(|| anyhow!("Queue '{}' not found", name))?;
+    Ok(q)
+}
+
+/// Purge all messages from a queue, return count
+pub async fn purge_queue_service(pool: &SqlitePool, name: &str) -> Result<u64> {
+    let deleted = db::purge_messages_by_queue(pool, name)
+        .await
+        .context("Failed to purge messages")?;
+    Ok(deleted)
+}
+
+/// Peek messages without leasing
+pub async fn peek_queue_service(
+    pool: &SqlitePool,
+    name: &str,
+    limit: i64,
+) -> Result<Vec<Message>> {
+    let msgs = db::peek_messages(pool, name, limit)
+        .await
+        .context("Failed to peek messages")?;
+    Ok(msgs)
+}
+
+/// Requeue DLQ messages back to main queue, return count
+pub async fn requeue_dlq_service(
+    pool: &SqlitePool,
+    name: &str,
+) -> Result<u64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis() as i64;
+    let moved = db::requeue_dlq(pool, name, now)
+        .await
+        .context("Failed to requeue DLQ messages")?;
+    Ok(moved)
+}
+
+/// Compact the database (VACUUM)
+pub async fn compact_service(pool: &SqlitePool) -> Result<()> {
+    db::compact_db(pool)
+        .await
+        .context("Failed to compact database")
+}
+/// Statistics for a queue: ready, leased, dlq counts
+pub async fn stats_service(
+    pool: &SqlitePool,
+    name: &str,
+) -> Result<serde_json::Value> {
+    // Get queue
+    let q = show_queue_service(pool, name).await?;
+    // Current time in ms
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis() as i64;
+    // Counts
+    let ready = db::count_ready_messages(pool, q.id, now)
+        .await
+        .context("Failed to count ready messages")?;
+    let leased = db::count_leased_messages(pool, q.id, now)
+        .await
+        .context("Failed to count leased messages")?;
+    let dlq_count = if let Some(dlq_id) = q.dlq_id {
+        db::count_messages_by_queue(pool, dlq_id)
+            .await
+            .context("Failed to count DLQ messages")?
+    } else {
+        0
+    };
+    Ok(serde_json::json!({ "ready": ready, "leased": leased, "dlq": dlq_count }))
+}
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Execute a queue command
@@ -80,7 +199,7 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
 
     match cmd {
         QueueCommands::List => {
-            let queues: Vec<Queue> = db::list_queues(&pool)
+            let queues: Vec<Queue> = list_queues_service(&pool)
                 .await
                 .context("Error listing queues")?;
             if queues.is_empty() {
@@ -103,25 +222,18 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
             max_attempts,
             visibility_ms,
         } => {
-            // Check for existing queue
-            if (db::get_queue_by_name(&pool, &name)
-                .await
-                .context("Error checking existing queue")?)
-            .is_some()
-            {
-                eprintln!("Queue '{}' already exists", name);
-                std::process::exit(1);
-            }
-            let id = db::create_queue(&pool, &name, None, max_attempts, visibility_ms)
+            // Create queue via service
+            let q = create_queue_service(&pool, &name, max_attempts, visibility_ms)
                 .await
                 .context("Error creating queue")?;
-            println!("Created queue '{}' with ID {}", name, id);
+            println!("Created queue '{}' with ID {}", q.name, q.id);
         }
         QueueCommands::Remove { name } => {
-            let deleted = db::delete_queue_by_name(&pool, &name)
+            // Delete queue via service
+            let removed = delete_queue_service(&pool, &name)
                 .await
                 .context("Error removing queue")?;
-            if deleted > 0 {
+            if removed {
                 println!("Removed queue '{}'", name);
             } else {
                 eprintln!("Queue '{}' not found", name);
@@ -130,10 +242,9 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
         }
         QueueCommands::Show { name } => {
             // Show queue details and stats
-            let q = db::get_queue_by_name(&pool, &name)
+            let q = show_queue_service(&pool, &name)
                 .await
-                .context("Error fetching queue")?
-                .ok_or_else(|| anyhow!("Queue '{}' not found", name))?;
+                .context("Error fetching queue")?;
             // Compute stats
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
             let ready = db::count_ready_messages(&pool, q.id, now).await?;
@@ -154,14 +265,14 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
         }
         QueueCommands::Purge { name } => {
             // Purge all messages in the queue
-            let deleted = db::purge_messages_by_queue(&pool, &name)
+            let deleted = purge_queue_service(&pool, &name)
                 .await
                 .context("Error purging messages")?;
             println!("Purged {} messages from queue '{}'", deleted, name);
         }
         QueueCommands::Peek { name, limit } => {
             // Peek messages without leasing
-            let msgs = db::peek_messages(&pool, &name, limit)
+            let msgs = peek_queue_service(&pool, &name, limit)
                 .await
                 .context("Error peeking messages")?;
             for m in msgs {
@@ -170,15 +281,16 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
         }
         QueueCommands::RequeueDlq { name } => {
             // Requeue DLQ messages back to main queue
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-            let moved = db::requeue_dlq(&pool, &name, now)
+            let moved = requeue_dlq_service(&pool, &name)
                 .await
                 .context("Error requeueing DLQ messages")?;
             println!("Requeued {} messages from DLQ to queue '{}'", moved, name);
         }
         QueueCommands::Compact { name: _ } => {
             // Compact the SQLite database
-            db::compact_db(&pool).await?;
+            compact_service(&pool)
+                .await
+                .context("Error compacting database")?;
             println!("Compacted database (VACUUM)");
         }
     }
