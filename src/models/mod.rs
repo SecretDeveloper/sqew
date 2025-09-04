@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, FromRow)]
 pub struct Queue {
     pub id: i64,
     pub name: String,
@@ -9,7 +10,7 @@ pub struct Queue {
     pub visibility_ms: i32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, FromRow)]
 pub struct Message {
     pub id: i64,
     pub queue_id: i64,

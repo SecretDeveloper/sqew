@@ -1,12 +1,11 @@
 use crate::models::{Message, Queue};
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 
 pub async fn get_queue_by_name(pool: &SqlitePool, name: &str) -> sqlx::Result<Option<Queue>> {
-    sqlx::query_as!(
-        Queue,
-        "SELECT id, name, dlq_id, max_attempts, visibility_ms FROM queue WHERE name = ?",
-        name
+    sqlx::query_as::<_, Queue>(
+        "SELECT id, name, dlq_id, max_attempts, visibility_ms FROM queue WHERE name = ?"
     )
+    .bind(name)
     .fetch_optional(pool)
     .await
 }
@@ -50,12 +49,31 @@ pub async fn enqueue_message(pool: &SqlitePool, msg: &Message) -> sqlx::Result<i
 }
 
 pub async fn get_message_by_id(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Message>> {
-    sqlx::query_as!(Message,
-        "SELECT id, queue_id, payload_json, priority, idempotency_key, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at FROM message WHERE id = ?",
-        id
+    sqlx::query_as::<_, Message>(
+        "SELECT id, queue_id, payload_json, priority, idempotency_key, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at FROM message WHERE id = ?"
     )
+    .bind(id)
     .fetch_optional(pool)
     .await
+}
+/// List all queues
+pub async fn list_queues(pool: &SqlitePool) -> sqlx::Result<Vec<Queue>> {
+    sqlx::query_as::<_, Queue>(
+        "SELECT id, name, dlq_id, max_attempts, visibility_ms FROM queue ORDER BY id"
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete a queue by name, returning how many rows were affected
+pub async fn delete_queue_by_name(pool: &SqlitePool, name: &str) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "DELETE FROM queue WHERE name = ?"
+    )
+    .bind(name)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 // Add more helper functions for poll, ack, nack, batch operations, DLQ, etc.
