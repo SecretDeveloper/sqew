@@ -1,6 +1,6 @@
-use clap::{Parser, Subcommand};
-use crate::server;
 use crate::queue::{self, MessageCommands, QueueCommands};
+use crate::server;
+use clap::{Parser, Subcommand};
 
 /// Sqew CLI interface
 #[derive(Parser, Debug)]

@@ -1,4 +1,5 @@
 use clap::Subcommand;
+// (moved imports closer to usage below)
 
 /// Queue-related CLI subcommands
 #[derive(Subcommand, Debug)]
@@ -21,6 +22,34 @@ pub enum QueueCommands {
         /// Queue name
         name: String,
     },
+    /// Show queue details and stats
+    Show {
+        /// Queue name
+        name: String,
+    },
+    /// Purge (delete) all messages in the queue
+    Purge {
+        /// Queue name
+        name: String,
+    },
+    /// Peek messages without leasing
+    Peek {
+        /// Queue name
+        name: String,
+        /// Number of messages to peek
+        #[arg(long, default_value_t = 1)]
+        limit: i64,
+    },
+    /// Requeue all DLQ messages back to the main queue
+    RequeueDlq {
+        /// Queue name
+        name: String,
+    },
+    /// Compact the database (VACUUM)
+    Compact {
+        /// Queue name (unused, for CLI consistency)
+        name: String,
+    },
 }
 
 /// Message-related CLI subcommands
@@ -39,23 +68,15 @@ pub enum MessageCommands {
 /// Execute a queue command
 use crate::db;
 use crate::models::Queue;
-use sqlx::SqlitePool;
-use std::env;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Execute a queue command
 pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
-    // Initialize database connection
-    let current_dir = env::current_dir().context("Failed to get current directory")?;
-    let db_file = current_dir.join("sqew.db");
-    if !db_file.exists() {
-        std::fs::File::create(&db_file)
-            .with_context(|| format!("Failed to create DB file at {}", db_file.display()))?;
-    }
-    let db_url = format!("sqlite://{}", db_file.to_string_lossy());
-    let pool = SqlitePool::connect(&db_url)
-        .await
-        .context("Failed to connect to the database")?;
+    // Ensure database exists and migrations applied
+    db::create_db_if_needed().await?;
+    // Initialize database pool
+    let pool = db::init_pool().await?;
 
     match cmd {
         QueueCommands::List => {
@@ -65,24 +86,29 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
             if queues.is_empty() {
                 println!("No queues found");
             } else {
-                println!("{:<5} {:<20} {:<12} {:<14} {}", "ID", "NAME", "MAX_ATTEMPTS", "VISIBILITY_MS", "DLQ_ID");
+                println!(
+                    "{:<5} {:<20} {:<12} {:<14} DLQ_ID",
+                    "ID", "NAME", "MAX_ATTEMPTS", "VISIBILITY_MS"
+                );
                 for q in queues {
                     println!(
                         "{:<5} {:<20} {:<12} {:<14} {:?}",
-                        q.id,
-                        q.name,
-                        q.max_attempts,
-                        q.visibility_ms,
-                        q.dlq_id
+                        q.id, q.name, q.max_attempts, q.visibility_ms, q.dlq_id
                     );
                 }
             }
         }
-        QueueCommands::Add { name, max_attempts, visibility_ms } => {
+        QueueCommands::Add {
+            name,
+            max_attempts,
+            visibility_ms,
+        } => {
             // Check for existing queue
-            if let Some(_) = db::get_queue_by_name(&pool, &name)
+            if (db::get_queue_by_name(&pool, &name)
                 .await
-                .context("Error checking existing queue")? {
+                .context("Error checking existing queue")?)
+            .is_some()
+            {
                 eprintln!("Queue '{}' already exists", name);
                 std::process::exit(1);
             }
@@ -102,12 +128,66 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
                 std::process::exit(1);
             }
         }
+        QueueCommands::Show { name } => {
+            // Show queue details and stats
+            let q = db::get_queue_by_name(&pool, &name)
+                .await
+                .context("Error fetching queue")?
+                .ok_or_else(|| anyhow!("Queue '{}' not found", name))?;
+            // Compute stats
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+            let ready = db::count_ready_messages(&pool, q.id, now).await?;
+            let leased = db::count_leased_messages(&pool, q.id, now).await?;
+            let dlq_count = if let Some(dlq_id) = q.dlq_id {
+                db::count_messages_by_queue(&pool, dlq_id).await?
+            } else {
+                0
+            };
+            println!("Queue '{}' (ID={})", q.name, q.id);
+            println!("  max_attempts: {}", q.max_attempts);
+            println!("  visibility_ms: {}", q.visibility_ms);
+            println!("  dlq_id: {:?}", q.dlq_id);
+            println!(
+                "Stats: ready={}, leased={}, dlq={}",
+                ready, leased, dlq_count
+            );
+        }
+        QueueCommands::Purge { name } => {
+            // Purge all messages in the queue
+            let deleted = db::purge_messages_by_queue(&pool, &name)
+                .await
+                .context("Error purging messages")?;
+            println!("Purged {} messages from queue '{}'", deleted, name);
+        }
+        QueueCommands::Peek { name, limit } => {
+            // Peek messages without leasing
+            let msgs = db::peek_messages(&pool, &name, limit)
+                .await
+                .context("Error peeking messages")?;
+            for m in msgs {
+                println!("[{}] {}", m.id, m.payload_json);
+            }
+        }
+        QueueCommands::RequeueDlq { name } => {
+            // Requeue DLQ messages back to main queue
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+            let moved = db::requeue_dlq(&pool, &name, now)
+                .await
+                .context("Error requeueing DLQ messages")?;
+            println!("Requeued {} messages from DLQ to queue '{}'", moved, name);
+        }
+        QueueCommands::Compact { name: _ } => {
+            // Compact the SQLite database
+            db::compact_db(&pool).await?;
+            println!("Compacted database (VACUUM)");
+        }
     }
     Ok(())
 }
 
 /// Execute a message command
-pub async fn run_message_command(cmd: MessageCommands) -> anyhow::Result<()> {
+/// Execute a message command
+pub async fn run_message_command(cmd: MessageCommands) -> Result<()> {
     match cmd {
         MessageCommands::Peek { queue, limit } => {
             println!("Peeking {} messages from queue '{}'", limit, queue);
