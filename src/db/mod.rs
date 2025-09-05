@@ -8,34 +8,30 @@ const INIT_SQL: &str = r#"
 CREATE TABLE queue (
   id            INTEGER PRIMARY KEY,
   name          TEXT UNIQUE NOT NULL,
-  dlq_id        INTEGER REFERENCES queue(id) ON DELETE SET NULL,
   max_attempts  INTEGER NOT NULL DEFAULT 5,
-  visibility_ms INTEGER NOT NULL DEFAULT 30000
+  visibility_ms INTEGER NULL DEFAULT NULL
 );
 
 CREATE TABLE message (
   id               INTEGER PRIMARY KEY,
   queue_id         INTEGER NOT NULL REFERENCES queue(id) ON DELETE CASCADE,
-  payload_json     TEXT NOT NULL,
-  priority         INTEGER NOT NULL DEFAULT 0,
-  idempotency_key  TEXT,
+  payload          TEXT NOT NULL,
   attempts         INTEGER NOT NULL DEFAULT 0,
   available_at     INTEGER NOT NULL,
   lease_expires_at INTEGER,
   leased_by        TEXT,
   created_at       INTEGER NOT NULL,
   expires_at       INTEGER,
-  UNIQUE(queue_id, idempotency_key)
 );
 
-CREATE INDEX ix_msg_ready ON message(queue_id, lease_expires_at, available_at, priority DESC);
+CREATE INDEX ix_msg_ready ON message(queue_id, lease_expires_at, available_at DESC);
 CREATE INDEX ix_msg_visible ON message(queue_id, available_at) WHERE lease_expires_at IS NULL;
 CREATE INDEX ix_msg_leased ON message(queue_id, lease_expires_at) WHERE lease_expires_at IS NOT NULL;
 "#;
 
 pub async fn get_queue_by_name(pool: &SqlitePool, name: &str) -> sqlx::Result<Option<Queue>> {
     sqlx::query_as::<_, Queue>(
-        "SELECT id, name, dlq_id, max_attempts, visibility_ms FROM queue WHERE name = ?",
+        "SELECT id, name, max_attempts, visibility_ms FROM queue WHERE name = ?",
     )
     .bind(name)
     .fetch_optional(pool)
@@ -45,30 +41,25 @@ pub async fn get_queue_by_name(pool: &SqlitePool, name: &str) -> sqlx::Result<Op
 pub async fn create_queue(
     pool: &SqlitePool,
     name: &str,
-    dlq_id: Option<i64>,
     max_attempts: i32,
     visibility_ms: i32,
 ) -> sqlx::Result<i64> {
-    let rec = sqlx::query(
-        "INSERT INTO queue (name, dlq_id, max_attempts, visibility_ms) VALUES (?, ?, ?, ?)",
-    )
-    .bind(name)
-    .bind(dlq_id)
-    .bind(max_attempts)
-    .bind(visibility_ms)
-    .execute(pool)
-    .await?;
+    let rec =
+        sqlx::query("INSERT INTO queue (name, max_attempts, visibility_ms) VALUES (?, ?, ?, ?)")
+            .bind(name)
+            .bind(max_attempts)
+            .bind(visibility_ms)
+            .execute(pool)
+            .await?;
     Ok(rec.last_insert_rowid())
 }
 
 pub async fn enqueue_message(pool: &SqlitePool, msg: &Message) -> sqlx::Result<i64> {
     let rec = sqlx::query(
-        "INSERT INTO message (queue_id, payload_json, priority, idempotency_key, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO message (queue_id, payload_json, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(msg.queue_id)
     .bind(&msg.payload_json)
-    .bind(msg.priority)
-    .bind(&msg.idempotency_key)
     .bind(msg.attempts)
     .bind(msg.available_at)
     .bind(msg.lease_expires_at)
@@ -82,7 +73,7 @@ pub async fn enqueue_message(pool: &SqlitePool, msg: &Message) -> sqlx::Result<i
 
 pub async fn get_message_by_id(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Message>> {
     sqlx::query_as::<_, Message>(
-        "SELECT id, queue_id, payload_json, priority, idempotency_key, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at FROM message WHERE id = ?"
+        "SELECT id, queue_id, payload_json, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at FROM message WHERE id = ?"
     )
     .bind(id)
     .fetch_optional(pool)
@@ -91,7 +82,7 @@ pub async fn get_message_by_id(pool: &SqlitePool, id: i64) -> sqlx::Result<Optio
 /// List all queues
 pub async fn list_queues(pool: &SqlitePool) -> sqlx::Result<Vec<Queue>> {
     sqlx::query_as::<_, Queue>(
-        "SELECT id, name, dlq_id, max_attempts, visibility_ms FROM queue ORDER BY id",
+        "SELECT id, name, max_attempts, visibility_ms FROM queue ORDER BY id",
     )
     .fetch_all(pool)
     .await
@@ -125,10 +116,10 @@ pub async fn peek_messages(
     limit: i64,
 ) -> sqlx::Result<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
-        "SELECT id, queue_id, payload_json, priority, idempotency_key, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at
+        "SELECT id, queue_id, payload_json, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at
          FROM message
          WHERE queue_id = (SELECT id FROM queue WHERE name = ?)
-         ORDER BY priority DESC, available_at, id
+         ORDER BY available_at, id
          LIMIT ?"
     )
     .bind(queue_name)
@@ -176,35 +167,13 @@ pub async fn count_leased_messages(
     Ok(count)
 }
 
-/// Count all messages in a queue (e.g., DLQ)
-pub async fn count_messages_by_queue(pool: &SqlitePool, queue_id: i64) -> sqlx::Result<i64> {
+/// Count queued messages in a queue
+pub async fn count_queued_messages_by_queue(pool: &SqlitePool, queue_id: i64) -> sqlx::Result<i64> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message WHERE queue_id = ?")
         .bind(queue_id)
         .fetch_one(pool)
         .await?;
     Ok(count)
-}
-
-/// Requeue all messages from the DLQ back to the main queue
-pub async fn requeue_dlq(pool: &SqlitePool, queue_name: &str, now_ms: i64) -> sqlx::Result<u64> {
-    // Move messages from DLQ to primary queue
-    let res = sqlx::query(
-        "UPDATE message
-         SET queue_id = (SELECT id FROM queue WHERE name = ?),
-             attempts = 0,
-             available_at = ?,
-             lease_expires_at = NULL,
-             leased_by = NULL
-         WHERE queue_id = (
-             SELECT dlq_id FROM queue WHERE name = ?
-         )",
-    )
-    .bind(queue_name)
-    .bind(now_ms)
-    .bind(queue_name)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
 }
 
 /// Run VACUUM to compact the database

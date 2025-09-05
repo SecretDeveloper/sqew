@@ -40,11 +40,6 @@ pub enum QueueCommands {
         #[arg(long, default_value_t = 1)]
         limit: i64,
     },
-    /// Requeue all DLQ messages back to the main queue
-    RequeueDlq {
-        /// Queue name
-        name: String,
-    },
     /// Compact the database (VACUUM)
     Compact {
         /// Queue name (unused, for CLI consistency)
@@ -68,33 +63,29 @@ pub enum MessageCommands {
 /// Execute a queue command
 use crate::db;
 // Re-export initialization functions
-pub use crate::db::{init_pool, create_db_if_needed};
+pub use crate::db::{create_db_if_needed, init_pool};
+use crate::models::Message;
 use crate::models::Queue;
 use anyhow::{Context, Result, anyhow};
 use sqlx::SqlitePool;
-use crate::models::Message;
 
 // Service-level queue operations, wrapping the DB layer
 /// List all queues
-pub async fn list_queues_service(pool: &SqlitePool) -> Result<Vec<Queue>> {
-    db::list_queues(pool)
-        .await
-        .context("Failed to list queues")
+pub async fn list_queues(pool: &SqlitePool) -> Result<Vec<Queue>> {
+    db::list_queues(pool).await.context("Failed to list queues")
 }
 
 /// Create a new queue, return the created Queue
-pub async fn create_queue_service(
+pub async fn create_queue(
     pool: &SqlitePool,
     name: &str,
     max_attempts: i32,
     visibility_ms: i32,
 ) -> Result<Queue> {
-    if db::get_queue_by_name(pool, name)
-        .await?
-        .is_some() {
+    if db::get_queue_by_name(pool, name).await?.is_some() {
         return Err(anyhow!("Queue '{}' already exists", name));
     }
-    db::create_queue(pool, name, None, max_attempts, visibility_ms)
+    db::create_queue(pool, name, max_attempts, visibility_ms)
         .await
         .context("Failed to create queue")?;
     let q = db::get_queue_by_name(pool, name)
@@ -105,7 +96,7 @@ pub async fn create_queue_service(
 }
 
 /// Delete a queue by name. Returns true if a queue was deleted
-pub async fn delete_queue_service(pool: &SqlitePool, name: &str) -> Result<bool> {
+pub async fn delete_queue(pool: &SqlitePool, name: &str) -> Result<bool> {
     let deleted = db::delete_queue_by_name(pool, name)
         .await
         .context("Failed to delete queue")?;
@@ -113,7 +104,7 @@ pub async fn delete_queue_service(pool: &SqlitePool, name: &str) -> Result<bool>
 }
 
 /// Show a queue by name
-pub async fn show_queue_service(pool: &SqlitePool, name: &str) -> Result<Queue> {
+pub async fn show_queue(pool: &SqlitePool, name: &str) -> Result<Queue> {
     let q = db::get_queue_by_name(pool, name)
         .await
         .context("Failed to fetch queue")?
@@ -122,7 +113,7 @@ pub async fn show_queue_service(pool: &SqlitePool, name: &str) -> Result<Queue> 
 }
 
 /// Purge all messages from a queue, return count
-pub async fn purge_queue_service(pool: &SqlitePool, name: &str) -> Result<u64> {
+pub async fn purge_queue(pool: &SqlitePool, name: &str) -> Result<u64> {
     let deleted = db::purge_messages_by_queue(pool, name)
         .await
         .context("Failed to purge messages")?;
@@ -130,48 +121,25 @@ pub async fn purge_queue_service(pool: &SqlitePool, name: &str) -> Result<u64> {
 }
 
 /// Peek messages without leasing
-pub async fn peek_queue_service(
-    pool: &SqlitePool,
-    name: &str,
-    limit: i64,
-) -> Result<Vec<Message>> {
+pub async fn peek_queue(pool: &SqlitePool, name: &str, limit: i64) -> Result<Vec<Message>> {
     let msgs = db::peek_messages(pool, name, limit)
         .await
         .context("Failed to peek messages")?;
     Ok(msgs)
 }
 
-/// Requeue DLQ messages back to main queue, return count
-pub async fn requeue_dlq_service(
-    pool: &SqlitePool,
-    name: &str,
-) -> Result<u64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_millis() as i64;
-    let moved = db::requeue_dlq(pool, name, now)
-        .await
-        .context("Failed to requeue DLQ messages")?;
-    Ok(moved)
-}
-
 /// Compact the database (VACUUM)
-pub async fn compact_service(pool: &SqlitePool) -> Result<()> {
+pub async fn compact(pool: &SqlitePool) -> Result<()> {
     db::compact_db(pool)
         .await
         .context("Failed to compact database")
 }
 /// Statistics for a queue: ready, leased, dlq counts
-pub async fn stats_service(
-    pool: &SqlitePool,
-    name: &str,
-) -> Result<serde_json::Value> {
+pub async fn stats(pool: &SqlitePool, name: &str) -> Result<serde_json::Value> {
     // Get queue
-    let q = show_queue_service(pool, name).await?;
+    let q = show_queue(pool, name).await?;
     // Current time in ms
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_millis() as i64;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     // Counts
     let ready = db::count_ready_messages(pool, q.id, now)
         .await
@@ -179,14 +147,7 @@ pub async fn stats_service(
     let leased = db::count_leased_messages(pool, q.id, now)
         .await
         .context("Failed to count leased messages")?;
-    let dlq_count = if let Some(dlq_id) = q.dlq_id {
-        db::count_messages_by_queue(pool, dlq_id)
-            .await
-            .context("Failed to count DLQ messages")?
-    } else {
-        0
-    };
-    Ok(serde_json::json!({ "ready": ready, "leased": leased, "dlq": dlq_count }))
+    Ok(serde_json::json!({ "ready": ready, "leased": leased}))
 }
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -199,9 +160,7 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
 
     match cmd {
         QueueCommands::List => {
-            let queues: Vec<Queue> = list_queues_service(&pool)
-                .await
-                .context("Error listing queues")?;
+            let queues: Vec<Queue> = list_queues(&pool).await.context("Error listing queues")?;
             if queues.is_empty() {
                 println!("No queues found");
             } else {
@@ -223,14 +182,14 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
             visibility_ms,
         } => {
             // Create queue via service
-            let q = create_queue_service(&pool, &name, max_attempts, visibility_ms)
+            let q = create_queue(&pool, &name, max_attempts, visibility_ms)
                 .await
                 .context("Error creating queue")?;
             println!("Created queue '{}' with ID {}", q.name, q.id);
         }
         QueueCommands::Remove { name } => {
             // Delete queue via service
-            let removed = delete_queue_service(&pool, &name)
+            let removed = delete_queue(&pool, &name)
                 .await
                 .context("Error removing queue")?;
             if removed {
@@ -242,55 +201,38 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
         }
         QueueCommands::Show { name } => {
             // Show queue details and stats
-            let q = show_queue_service(&pool, &name)
+            let q = show_queue(&pool, &name)
                 .await
                 .context("Error fetching queue")?;
             // Compute stats
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
             let ready = db::count_ready_messages(&pool, q.id, now).await?;
             let leased = db::count_leased_messages(&pool, q.id, now).await?;
-            let dlq_count = if let Some(dlq_id) = q.dlq_id {
-                db::count_messages_by_queue(&pool, dlq_id).await?
-            } else {
-                0
-            };
             println!("Queue '{}' (ID={})", q.name, q.id);
             println!("  max_attempts: {}", q.max_attempts);
             println!("  visibility_ms: {}", q.visibility_ms);
             println!("  dlq_id: {:?}", q.dlq_id);
-            println!(
-                "Stats: ready={}, leased={}, dlq={}",
-                ready, leased, dlq_count
-            );
+            println!("Stats: ready={}, leased={}", ready, leased);
         }
         QueueCommands::Purge { name } => {
             // Purge all messages in the queue
-            let deleted = purge_queue_service(&pool, &name)
+            let deleted = purge_queue(&pool, &name)
                 .await
                 .context("Error purging messages")?;
             println!("Purged {} messages from queue '{}'", deleted, name);
         }
         QueueCommands::Peek { name, limit } => {
             // Peek messages without leasing
-            let msgs = peek_queue_service(&pool, &name, limit)
+            let msgs = peek_queue(&pool, &name, limit)
                 .await
                 .context("Error peeking messages")?;
             for m in msgs {
                 println!("[{}] {}", m.id, m.payload_json);
             }
         }
-        QueueCommands::RequeueDlq { name } => {
-            // Requeue DLQ messages back to main queue
-            let moved = requeue_dlq_service(&pool, &name)
-                .await
-                .context("Error requeueing DLQ messages")?;
-            println!("Requeued {} messages from DLQ to queue '{}'", moved, name);
-        }
         QueueCommands::Compact { name: _ } => {
             // Compact the SQLite database
-            compact_service(&pool)
-                .await
-                .context("Error compacting database")?;
+            compact(&pool).await.context("Error compacting database")?;
             println!("Compacted database (VACUUM)");
         }
     }

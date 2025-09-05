@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::get,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -26,7 +26,7 @@ pub async fn run_server(port: u16) -> anyhow::Result<()> {
 
     // Build router with queue routes and shared state
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/health", get(|| async { "ok" }))
         // Queue endpoints
         .route("/queues", get(list_queues).post(create_queue))
         .route("/queues/{name}", get(show_queue).delete(delete_queue))
@@ -37,12 +37,10 @@ pub async fn run_server(port: u16) -> anyhow::Result<()> {
             get(peek_messages).delete(purge_messages),
         )
         // DLQ and maintenance
-        .route("/queues/{name}/dlq/requeue", post(requeue_dlq))
-        .route("/queues/{name}/compact", post(compact_db))
         .with_state(pool.clone());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    tracing::info!("Listening on {}", addr);
+    tracing::info!("Listening on {} - Use Ctrl+C to quit.", addr);
     let listener = TcpListener::bind(addr).await.map_err(|e| {
         tracing::error!("Failed to bind address: {e}");
         anyhow!("Bind error: {e}")
@@ -79,7 +77,7 @@ struct PeekParams {
 async fn list_queues(
     State(pool): State<SqlitePool>,
 ) -> Result<Json<Vec<Queue>>, (StatusCode, String)> {
-    let queues = queue::list_queues_service(&pool)
+    let queues = queue::list_queues(&pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(queues))
@@ -94,7 +92,7 @@ async fn create_queue(
     let max_attempts = body.max_attempts.unwrap_or(5);
     let visibility_ms = body.visibility_ms.unwrap_or(30000);
     // Create queue via service layer
-    let new_q = queue::create_queue_service(&pool, &name, max_attempts, visibility_ms)
+    let new_q = queue::create_queue(&pool, &name, max_attempts, visibility_ms)
         .await
         .map_err(|e| {
             if e.to_string().contains("already exists") {
@@ -111,7 +109,7 @@ async fn show_queue(
     Path(name): Path<String>,
     State(pool): State<SqlitePool>,
 ) -> Result<Json<Queue>, (StatusCode, String)> {
-    let q = queue::show_queue_service(&pool, &name)
+    let q = queue::show_queue(&pool, &name)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     Ok(Json(q))
@@ -119,7 +117,7 @@ async fn show_queue(
 
 // Delete a queue
 async fn delete_queue(Path(name): Path<String>, State(pool): State<SqlitePool>) -> StatusCode {
-    match queue::delete_queue_service(&pool, &name).await {
+    match queue::delete_queue(&pool, &name).await {
         Ok(true) => StatusCode::NO_CONTENT,
         _ => StatusCode::NOT_FOUND,
     }
@@ -130,7 +128,7 @@ async fn queue_stats(
     Path(name): Path<String>,
     State(pool): State<SqlitePool>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let stats = queue::stats_service(&pool, &name).await.map_err(|e| {
+    let stats = queue::stats(&pool, &name).await.map_err(|e| {
         if e.to_string().contains("not found") {
             (StatusCode::NOT_FOUND, e.to_string())
         } else {
@@ -147,7 +145,7 @@ async fn peek_messages(
     State(pool): State<SqlitePool>,
 ) -> Result<Json<Vec<Message>>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(1);
-    let msgs = queue::peek_queue_service(&pool, &name, limit)
+    let msgs = queue::peek_queue(&pool, &name, limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(msgs))
@@ -158,26 +156,15 @@ async fn purge_messages(
     Path(name): Path<String>,
     State(pool): State<SqlitePool>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let deleted = queue::purge_queue_service(&pool, &name)
+    let deleted = queue::purge_queue(&pool, &name)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({"deleted": deleted})))
 }
 
-// Requeue DLQ messages
-async fn requeue_dlq(
-    Path(name): Path<String>,
-    State(pool): State<SqlitePool>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let moved = queue::requeue_dlq_service(&pool, &name)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(json!({"requeued": moved})))
-}
-
 // Compact the database
 async fn compact_db(State(pool): State<SqlitePool>) -> StatusCode {
-    if queue::compact_service(&pool).await.is_ok() {
+    if queue::compact(&pool).await.is_ok() {
         StatusCode::OK
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
