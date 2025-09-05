@@ -64,7 +64,6 @@ pub async fn run_server(port: u16) -> anyhow::Result<()> {
 struct CreateQueueBody {
     name: String,
     max_attempts: Option<i32>,
-    visibility_ms: Option<i32>,
 }
 
 // Query parameters for peeking messages
@@ -90,9 +89,8 @@ async fn create_queue(
 ) -> Result<(StatusCode, Json<Queue>), (StatusCode, String)> {
     let name = body.name;
     let max_attempts = body.max_attempts.unwrap_or(5);
-    let visibility_ms = body.visibility_ms.unwrap_or(30000);
     // Create queue via service layer
-    let new_q = queue::create_queue(&pool, &name, max_attempts, visibility_ms)
+    let new_q = queue::create_queue(&pool, &name, max_attempts)
         .await
         .map_err(|e| {
             if e.to_string().contains("already exists") {

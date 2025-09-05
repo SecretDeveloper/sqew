@@ -8,8 +8,7 @@ const INIT_SQL: &str = r#"
 CREATE TABLE queue (
   id            INTEGER PRIMARY KEY,
   name          TEXT UNIQUE NOT NULL,
-  max_attempts  INTEGER NOT NULL DEFAULT 5,
-  visibility_ms INTEGER NULL DEFAULT NULL
+  max_attempts  INTEGER NOT NULL DEFAULT 5
 );
 
 CREATE TABLE message (
@@ -18,54 +17,37 @@ CREATE TABLE message (
   payload          TEXT NOT NULL,
   attempts         INTEGER NOT NULL DEFAULT 0,
   available_at     INTEGER NOT NULL,
-  lease_expires_at INTEGER,
-  leased_by        TEXT,
-  created_at       INTEGER NOT NULL,
-  expires_at       INTEGER,
+  created_at       INTEGER NOT NULL
 );
 
-CREATE INDEX ix_msg_ready ON message(queue_id, lease_expires_at, available_at DESC);
-CREATE INDEX ix_msg_visible ON message(queue_id, available_at) WHERE lease_expires_at IS NULL;
-CREATE INDEX ix_msg_leased ON message(queue_id, lease_expires_at) WHERE lease_expires_at IS NOT NULL;
+CREATE INDEX ix_msg_visible ON message(queue_id, available_at);
 "#;
 
 pub async fn get_queue_by_name(pool: &SqlitePool, name: &str) -> sqlx::Result<Option<Queue>> {
-    sqlx::query_as::<_, Queue>(
-        "SELECT id, name, max_attempts, visibility_ms FROM queue WHERE name = ?",
-    )
-    .bind(name)
-    .fetch_optional(pool)
-    .await
+    sqlx::query_as::<_, Queue>("SELECT id, name, max_attempts FROM queue WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
 }
 
-pub async fn create_queue(
-    pool: &SqlitePool,
-    name: &str,
-    max_attempts: i32,
-    visibility_ms: i32,
-) -> sqlx::Result<i64> {
-    let rec =
-        sqlx::query("INSERT INTO queue (name, max_attempts, visibility_ms) VALUES (?, ?, ?, ?)")
-            .bind(name)
-            .bind(max_attempts)
-            .bind(visibility_ms)
-            .execute(pool)
-            .await?;
+pub async fn create_queue(pool: &SqlitePool, name: &str, max_attempts: i32) -> sqlx::Result<i64> {
+    let rec = sqlx::query("INSERT INTO queue (name, max_attempts) VALUES (?, ?)")
+        .bind(name)
+        .bind(max_attempts)
+        .execute(pool)
+        .await?;
     Ok(rec.last_insert_rowid())
 }
 
 pub async fn enqueue_message(pool: &SqlitePool, msg: &Message) -> sqlx::Result<i64> {
     let rec = sqlx::query(
-        "INSERT INTO message (queue_id, payload_json, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO message (queue_id, payload_json, attempts, available_at, created_at) VALUES (?, ?, ?, ?, ?)"
     )
     .bind(msg.queue_id)
-    .bind(&msg.payload_json)
+    .bind(&msg.payload)
     .bind(msg.attempts)
     .bind(msg.available_at)
-    .bind(msg.lease_expires_at)
-    .bind(&msg.leased_by)
     .bind(msg.created_at)
-    .bind(msg.expires_at)
     .execute(pool)
     .await?;
     Ok(rec.last_insert_rowid())
@@ -73,7 +55,7 @@ pub async fn enqueue_message(pool: &SqlitePool, msg: &Message) -> sqlx::Result<i
 
 pub async fn get_message_by_id(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Message>> {
     sqlx::query_as::<_, Message>(
-        "SELECT id, queue_id, payload_json, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at FROM message WHERE id = ?"
+        "SELECT id, queue_id, payload_json, attempts, available_at, created_at FROM message WHERE id = ?"
     )
     .bind(id)
     .fetch_optional(pool)
@@ -81,11 +63,9 @@ pub async fn get_message_by_id(pool: &SqlitePool, id: i64) -> sqlx::Result<Optio
 }
 /// List all queues
 pub async fn list_queues(pool: &SqlitePool) -> sqlx::Result<Vec<Queue>> {
-    sqlx::query_as::<_, Queue>(
-        "SELECT id, name, max_attempts, visibility_ms FROM queue ORDER BY id",
-    )
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, Queue>("SELECT id, name, max_attempts FROM queue ORDER BY id")
+        .fetch_all(pool)
+        .await
 }
 
 /// Delete a queue by name, returning how many rows were affected
@@ -116,11 +96,11 @@ pub async fn peek_messages(
     limit: i64,
 ) -> sqlx::Result<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
-        "SELECT id, queue_id, payload_json, attempts, available_at, lease_expires_at, leased_by, created_at, expires_at
+        "SELECT id, queue_id, payload, attempts, available_at, created_at
          FROM message
          WHERE queue_id = (SELECT id FROM queue WHERE name = ?)
          ORDER BY available_at, id
-         LIMIT ?"
+         LIMIT ?",
     )
     .bind(queue_name)
     .bind(limit)
@@ -138,27 +118,7 @@ pub async fn count_ready_messages(
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM message
          WHERE queue_id = ?
-           AND available_at <= ?
-           AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
-    )
-    .bind(queue_id)
-    .bind(now_ms)
-    .bind(now_ms)
-    .fetch_one(pool)
-    .await?;
-    Ok(count)
-}
-
-/// Count leased messages (lease_expires_at > now)
-pub async fn count_leased_messages(
-    pool: &SqlitePool,
-    queue_id: i64,
-    now_ms: i64,
-) -> sqlx::Result<i64> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM message
-         WHERE queue_id = ?
-           AND lease_expires_at > ?",
+           AND available_at <= ?",
     )
     .bind(queue_id)
     .bind(now_ms)

@@ -13,9 +13,6 @@ pub enum QueueCommands {
         /// Maximum attempts (default: 5)
         #[arg(long, default_value_t = 5)]
         max_attempts: i32,
-        /// Visibility timeout in ms (default: 30000)
-        #[arg(long, default_value_t = 30000)]
-        visibility_ms: i32,
     },
     /// Remove a queue
     Remove {
@@ -76,16 +73,11 @@ pub async fn list_queues(pool: &SqlitePool) -> Result<Vec<Queue>> {
 }
 
 /// Create a new queue, return the created Queue
-pub async fn create_queue(
-    pool: &SqlitePool,
-    name: &str,
-    max_attempts: i32,
-    visibility_ms: i32,
-) -> Result<Queue> {
+pub async fn create_queue(pool: &SqlitePool, name: &str, max_attempts: i32) -> Result<Queue> {
     if db::get_queue_by_name(pool, name).await?.is_some() {
         return Err(anyhow!("Queue '{}' already exists", name));
     }
-    db::create_queue(pool, name, max_attempts, visibility_ms)
+    db::create_queue(pool, name, max_attempts)
         .await
         .context("Failed to create queue")?;
     let q = db::get_queue_by_name(pool, name)
@@ -144,11 +136,9 @@ pub async fn stats(pool: &SqlitePool, name: &str) -> Result<serde_json::Value> {
     let ready = db::count_ready_messages(pool, q.id, now)
         .await
         .context("Failed to count ready messages")?;
-    let leased = db::count_leased_messages(pool, q.id, now)
-        .await
-        .context("Failed to count leased messages")?;
-    Ok(serde_json::json!({ "ready": ready, "leased": leased}))
+    Ok(serde_json::json!({ "ready": ready}))
 }
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Execute a queue command
@@ -164,25 +154,15 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
             if queues.is_empty() {
                 println!("No queues found");
             } else {
-                println!(
-                    "{:<5} {:<20} {:<12} {:<14} DLQ_ID",
-                    "ID", "NAME", "MAX_ATTEMPTS", "VISIBILITY_MS"
-                );
+                println!("{:<5} {:<20} {:<12}", "ID", "NAME", "MAX_ATTEMPTS");
                 for q in queues {
-                    println!(
-                        "{:<5} {:<20} {:<12} {:<14} {:?}",
-                        q.id, q.name, q.max_attempts, q.visibility_ms, q.dlq_id
-                    );
+                    println!("{:<5} {:<20} {:<12}", q.id, q.name, q.max_attempts);
                 }
             }
         }
-        QueueCommands::Add {
-            name,
-            max_attempts,
-            visibility_ms,
-        } => {
+        QueueCommands::Add { name, max_attempts } => {
             // Create queue via service
-            let q = create_queue(&pool, &name, max_attempts, visibility_ms)
+            let q = create_queue(&pool, &name, max_attempts)
                 .await
                 .context("Error creating queue")?;
             println!("Created queue '{}' with ID {}", q.name, q.id);
@@ -207,12 +187,9 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
             // Compute stats
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
             let ready = db::count_ready_messages(&pool, q.id, now).await?;
-            let leased = db::count_leased_messages(&pool, q.id, now).await?;
             println!("Queue '{}' (ID={})", q.name, q.id);
             println!("  max_attempts: {}", q.max_attempts);
-            println!("  visibility_ms: {}", q.visibility_ms);
-            println!("  dlq_id: {:?}", q.dlq_id);
-            println!("Stats: ready={}, leased={}", ready, leased);
+            println!("Stats: ready={}", ready);
         }
         QueueCommands::Purge { name } => {
             // Purge all messages in the queue
@@ -227,7 +204,7 @@ pub async fn run_queue_command(cmd: QueueCommands) -> Result<()> {
                 .await
                 .context("Error peeking messages")?;
             for m in msgs {
-                println!("[{}] {}", m.id, m.payload_json);
+                println!("[{}] {}", m.id, m.payload);
             }
         }
         QueueCommands::Compact { name: _ } => {
