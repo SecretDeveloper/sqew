@@ -1,7 +1,37 @@
 use crate::models::{Message, Queue};
 use anyhow::Context;
-use sqlx::{SqlitePool, migrate::Migrator};
+use sqlx::{Executor, SqlitePool};
 use std::{env, fs};
+// Embedded initial SQL schema for bootstrapping a new database
+const INIT_SQL: &str = r#"
+-- Initial schema for Sqew message queue
+CREATE TABLE queue (
+  id            INTEGER PRIMARY KEY,
+  name          TEXT UNIQUE NOT NULL,
+  dlq_id        INTEGER REFERENCES queue(id) ON DELETE SET NULL,
+  max_attempts  INTEGER NOT NULL DEFAULT 5,
+  visibility_ms INTEGER NOT NULL DEFAULT 30000
+);
+
+CREATE TABLE message (
+  id               INTEGER PRIMARY KEY,
+  queue_id         INTEGER NOT NULL REFERENCES queue(id) ON DELETE CASCADE,
+  payload_json     TEXT NOT NULL,
+  priority         INTEGER NOT NULL DEFAULT 0,
+  idempotency_key  TEXT,
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  available_at     INTEGER NOT NULL,
+  lease_expires_at INTEGER,
+  leased_by        TEXT,
+  created_at       INTEGER NOT NULL,
+  expires_at       INTEGER,
+  UNIQUE(queue_id, idempotency_key)
+);
+
+CREATE INDEX ix_msg_ready ON message(queue_id, lease_expires_at, available_at, priority DESC);
+CREATE INDEX ix_msg_visible ON message(queue_id, available_at) WHERE lease_expires_at IS NULL;
+CREATE INDEX ix_msg_leased ON message(queue_id, lease_expires_at) WHERE lease_expires_at IS NOT NULL;
+"#;
 
 pub async fn get_queue_by_name(pool: &SqlitePool, name: &str) -> sqlx::Result<Option<Queue>> {
     sqlx::query_as::<_, Queue>(
@@ -182,8 +212,7 @@ pub async fn compact_db(pool: &SqlitePool) -> sqlx::Result<()> {
     sqlx::query("VACUUM").execute(pool).await?;
     Ok(())
 }
-// Embed migrations from the `migrations` directory
-static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+// The initial schema is embedded via the migrations directory SQL
 
 /// Initialize the SQLite connection pool.
 pub async fn init_pool() -> anyhow::Result<SqlitePool> {
@@ -200,19 +229,24 @@ pub async fn init_pool() -> anyhow::Result<SqlitePool> {
 pub async fn create_db_if_needed() -> anyhow::Result<()> {
     let current_dir = env::current_dir().context("Failed to get current directory")?;
     let db_file = current_dir.join("sqew.db");
-    // Only run migrations on a new database
-    if !db_file.exists() {
+    // Ensure database file exists
+    let is_new = if !db_file.exists() {
         fs::File::create(&db_file)
             .with_context(|| format!("Failed to create DB file at {}", db_file.display()))?;
+        true
+    } else {
+        false
+    };
+    // If new database, initialize schema
+    if is_new {
         let db_url = format!("sqlite://{}", db_file.to_string_lossy());
         let pool = SqlitePool::connect(&db_url)
             .await
-            .context("Failed to connect to the database for migrations")?;
-
-        MIGRATOR
-            .run(&pool)
+            .context("Failed to connect to the database for initialization")?;
+        // Load and execute initial schema
+        pool.execute(INIT_SQL)
             .await
-            .context("Failed to run database migrations")?;
+            .context("Failed to execute initial database schema")?;
     }
     Ok(())
 }
