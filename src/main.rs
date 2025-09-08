@@ -1,10 +1,5 @@
-mod cli;
-mod db;
-mod models;
-mod queue;
-mod server;
-
 use clap::Parser;
+use sqew::cli;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

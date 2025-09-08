@@ -1,5 +1,6 @@
 use crate::models::{Message, Queue};
 use crate::queue;
+use crate::queue::Config as QueueConfig;
 use anyhow::anyhow;
 use axum::{
     Json, Router,
@@ -19,10 +20,8 @@ pub async fn run_server(port: u16) -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
-    // Ensure database exists and migrations applied
-    queue::create_db_if_needed().await?;
-    // Initialize database pool
-    let pool = queue::init_pool().await?;
+    // Initialize database pool (ensures DB exists and schema is ready)
+    let pool = queue::init_pool(&QueueConfig::default()).await?;
 
     // Build router with queue routes and shared state
     let app = Router::new()
@@ -47,9 +46,7 @@ pub async fn run_server(port: u16) -> anyhow::Result<()> {
     })?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            signal::ctrl_c()
-                .await
-                .expect("failed to install Ctrl+C handler");
+            signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
             tracing::info!("Received Ctrl+C, shutting down gracefully...");
         })
         .await
@@ -74,7 +71,7 @@ struct PeekParams {
 
 // List all queues
 async fn list_queues(
-    State(pool): State<SqlitePool>,
+    State(pool): State<SqlitePool>
 ) -> Result<Json<Vec<Queue>>, (StatusCode, String)> {
     let queues = queue::list_queues(&pool)
         .await
@@ -90,9 +87,8 @@ async fn create_queue(
     let name = body.name;
     let max_attempts = body.max_attempts.unwrap_or(5);
     // Create queue via service layer
-    let new_q = queue::create_queue(&pool, &name, max_attempts)
-        .await
-        .map_err(|e| {
+    let new_q =
+        queue::create_queue(&pool, &name, max_attempts).await.map_err(|e| {
             if e.to_string().contains("already exists") {
                 (StatusCode::CONFLICT, e.to_string())
             } else {
@@ -114,7 +110,10 @@ async fn show_queue(
 }
 
 // Delete a queue
-async fn delete_queue(Path(name): Path<String>, State(pool): State<SqlitePool>) -> StatusCode {
+async fn delete_queue(
+    Path(name): Path<String>,
+    State(pool): State<SqlitePool>,
+) -> StatusCode {
     match queue::delete_queue(&pool, &name).await {
         Ok(true) => StatusCode::NO_CONTENT,
         _ => StatusCode::NOT_FOUND,

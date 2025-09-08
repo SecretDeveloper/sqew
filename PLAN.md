@@ -29,7 +29,6 @@
 
 ## 8. Delivery Semantics
 - Implement at-least-once delivery, visibility timeouts, lease tokens, idempotency key logic
-- Handle retries, backoff, TTL, DLQ routing
 
 ## 9. Security
 - Add per-queue API key authentication
