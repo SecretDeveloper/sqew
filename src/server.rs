@@ -11,7 +11,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::TcpListener;
 use tokio::signal;
 
@@ -26,7 +26,12 @@ pub async fn run_server(port: u16) -> anyhow::Result<()> {
     // Build router with queue routes and shared state
     let app = app_router(pool.clone());
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    // Allow overriding bind address via env (useful for Docker). Default 127.0.0.1
+    let bind_ip = std::env::var("SQEW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let ip: IpAddr = bind_ip
+        .parse()
+        .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    let addr = SocketAddr::from((ip, port));
     tracing::info!("Listening on {} - Use Ctrl+C to quit.", addr);
     let listener = TcpListener::bind(addr).await.map_err(|e| {
         tracing::error!("Failed to bind address: {e}");

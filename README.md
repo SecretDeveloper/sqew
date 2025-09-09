@@ -159,3 +159,110 @@ Sqew is a lightweight message queue service and cli tool.
     - Ensure binaries aren’t stripped; keep frame pointers.
   - To force dev profile via script, pass `--dev-profile` as the first argument:
     - `scripts/flame-stress.sh --dev-profile mixed 32 2000`
+
+---
+
+## Quick Start
+
+- Build the project:
+  - `cargo build` (or `cargo build --release`)
+- Run the server locally (listens on 127.0.0.1):
+  - `cargo run -- serve --port 8888`
+- Create a queue via CLI:
+  - `cargo run -- queue add --name demo --max-attempts 5`
+- Enqueue a message via CLI:
+  - `cargo run -- message enqueue --queue demo --payload '{"hello":"world"}'`
+- Poll and ack via CLI:
+  - `cargo run -- message poll --queue demo --batch 1 --visibility-ms 30000`
+  - `cargo run -- message ack --ids <id1,id2>`
+
+## CLI Usage (Implemented)
+
+- Server
+  - `sqew serve --port 8888`
+- Queues
+  - `sqew queue list`
+  - `sqew queue add --name <name> --max-attempts <n>`
+  - `sqew queue show --name <name>`
+  - `sqew queue purge --name <name>`
+  - `sqew queue peek --name <name> --limit <n>`
+  - `sqew queue remove --name <name>`
+  - `sqew queue compact --name <name>` (VACUUM)
+- Messages
+  - `sqew message enqueue --queue <name> --payload '<json>' [--delay-ms <ms>]`
+  - `sqew message enqueue --queue <name> --file <ndjson-or-json-array> [--delay-ms <ms>]`
+  - `sqew message poll --queue <name> --batch <n> --visibility-ms <ms>`
+  - `sqew message ack --ids <id1,id2,...>`
+  - `sqew message nack --ids <id1,id2,...> --delay-ms <ms>`
+  - `sqew message remove --id <id>`
+  - `sqew message peek --queue <name> --limit <n>`
+  - `sqew message peek-id --id <id>`
+
+Notes
+- Delivery is at-least-once. Duplicates can occur under concurrency; always ack after successful processing.
+- Visibility timeout controls lease duration for polled messages; unacked leases become visible again after the timeout.
+
+## HTTP API (Implemented)
+
+- Health
+  - `GET /health` → `200 ok`
+- Queues
+  - `GET /queues` → `200` JSON array of queues
+  - `POST /queues` body `{ "name": "q", "max_attempts": 5 }` → `201` queue
+  - `GET /queues/{name}` → `200` queue or `404`
+  - `DELETE /queues/{name}` → `204` or `404`
+  - `GET /queues/{name}/stats` → `200` `{ "ready": <i64> }`
+- Messages
+  - `GET /queues/{name}/messages?limit=N` → `200` list (peek; no leasing)
+  - `POST /queues/{name}/messages` body `{ "payload": <json>, "delay_ms": 0 }` → `201` created message
+  - `DELETE /queues/{name}/messages` → `200` `{ "deleted": <u64> }`
+
+Examples (curl)
+- Create a queue
+  - `curl -s localhost:8888/queues -X POST -H 'content-type: application/json' -d '{"name":"demo","max_attempts":5}'`
+- Enqueue a message
+  - `curl -s localhost:8888/queues/demo/messages -X POST -H 'content-type: application/json' -d '{"payload":{"k":"v"}}'`
+- Peek up to 10 messages
+  - `curl -s 'localhost:8888/queues/demo/messages?limit=10'`
+- Queue stats
+  - `curl -s localhost:8888/queues/demo/stats`
+- Purge
+  - `curl -s localhost:8888/queues/demo/messages -X DELETE`
+
+## Storage & Configuration
+
+- Database: SQLite file `sqew.db` at the project root by default (git-ignored).
+- The service configures SQLite for concurrency: WAL mode, busy_timeout, synchronous=NORMAL.
+- CLI and tests create the DB if missing and apply the embedded schema.
+- Custom DB path (library): use `queue::Config { db_path, force_recreate }` with `queue::init_pool(&cfg)`.
+
+## Development
+
+- Build: `cargo build` (release: `cargo build --release`)
+- Lint: `cargo clippy --all-targets`
+- Format: `cargo fmt --all`
+- Run server: `cargo run -- serve --port 8888`
+- Bacon (optional): `bacon` then press `c` (clippy), `t` (test), `r` (run)
+
+## Testing & Stress
+
+- Unit/integration tests: `cargo test`
+- Stress tests (in-process HTTP), configurable via env vars:
+  - `SQEW_STRESS_TOTAL`, `SQEW_STRESS_CONCURRENCY`, `SQEW_STRESS_PRODUCERS`, `SQEW_STRESS_CONSUMERS`, `SQEW_STRESS_BATCH`, `SQEW_STRESS_VIS_MS`
+- Run a single stress test:
+  - Enqueue-only: `cargo test --test stress_tests -- --exact concurrent_enqueue_no_loss --nocapture`
+  - Enqueue+drain: `cargo test --test stress_tests -- --exact concurrent_enqueue_and_drain_no_loss --nocapture`
+  - Mixed produce/consume: `cargo test --test stress_tests -- --exact concurrent_mixed_produce_consume_counts_ok --nocapture`
+
+## Docker
+
+- Build image:
+  - `docker build -t sqew:latest .`
+- Run server (binds to 0.0.0.0:8888 in container):
+  - `docker run --rm -p 8888:8888 -v $(pwd)/data:/data -e SQEW_BIND=0.0.0.0 sqew:latest`
+- Data location:
+  - The container works from `/data` (default DB path: `/data/sqew.db`). Mount a host directory to persist data.
+- Health check:
+  - `curl -s localhost:8888/health`
+- Create a queue:
+  - `curl -s localhost:8888/queues -X POST -H 'content-type: application/json' -d '{"name":"demo","max_attempts":5}'`
