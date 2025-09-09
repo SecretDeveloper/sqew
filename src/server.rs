@@ -24,19 +24,7 @@ pub async fn run_server(port: u16) -> anyhow::Result<()> {
     let pool = queue::init_pool(&QueueConfig::default()).await?;
 
     // Build router with queue routes and shared state
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        // Queue endpoints
-        .route("/queues", get(list_queues).post(create_queue))
-        .route("/queues/{name}", get(show_queue).delete(delete_queue))
-        .route("/queues/{name}/stats", get(queue_stats))
-        // Message endpoints
-        .route(
-            "/queues/{name}/messages",
-            get(peek_messages).delete(purge_messages),
-        )
-        // DLQ and maintenance
-        .with_state(pool.clone());
+    let app = app_router(pool.clone());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!("Listening on {} - Use Ctrl+C to quit.", addr);
@@ -56,6 +44,24 @@ pub async fn run_server(port: u16) -> anyhow::Result<()> {
         })?;
     Ok(())
 }
+
+/// Construct the Axum `Router` for the service, injecting shared state.
+pub fn app_router(pool: SqlitePool) -> Router {
+    Router::new()
+        .route("/health", get(|| async { "ok" }))
+        // Queue endpoints
+        .route("/queues", get(list_queues).post(create_queue))
+        .route("/queues/{name}", get(show_queue).delete(delete_queue))
+        .route("/queues/{name}/stats", get(queue_stats))
+        // Message endpoints
+        .route(
+            "/queues/{name}/messages",
+            get(peek_messages)
+                .post(enqueue_message_http)
+                .delete(purge_messages),
+        )
+        .with_state(pool)
+}
 // Request payload for creating a queue
 #[derive(Deserialize)]
 struct CreateQueueBody {
@@ -67,6 +73,14 @@ struct CreateQueueBody {
 #[derive(Deserialize)]
 struct PeekParams {
     limit: Option<i64>,
+}
+
+// Request payload for enqueueing a message
+#[derive(Deserialize)]
+struct EnqueueBody {
+    payload: serde_json::Value,
+    #[serde(default)]
+    delay_ms: Option<i64>,
 }
 
 // List all queues
@@ -159,11 +173,15 @@ async fn purge_messages(
     Ok(Json(json!({"deleted": deleted})))
 }
 
-// Compact the database
-async fn compact_db(State(pool): State<SqlitePool>) -> StatusCode {
-    if queue::compact(&pool).await.is_ok() {
-        StatusCode::OK
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    }
+// Enqueue a single message into a queue via HTTP
+async fn enqueue_message_http(
+    Path(name): Path<String>,
+    State(pool): State<SqlitePool>,
+    Json(body): Json<EnqueueBody>,
+) -> Result<(StatusCode, Json<Message>), (StatusCode, String)> {
+    let delay = body.delay_ms.unwrap_or(0);
+    let created = queue::enqueue_message(&pool, &name, &body.payload, delay)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(created)))
 }

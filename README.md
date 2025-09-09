@@ -139,3 +139,23 @@ Sqew is a lightweight message queue service and cli tool.
 * Validate JSON strictly; drop massive/recursive payloads; set request body limits.
 * CORS defaults to **off** unless you need browser producers.
 
+---
+
+## Flamegraphs (Performance)
+
+- Prereqs: `cargo install flamegraph`.
+  - Linux: requires `perf` (install via your distro).
+  - macOS: uses `dtrace` and typically requires `sudo`.
+- A concurrent stress test exists at `tests/stress_tests.rs` (ignored by default).
+- Script to generate a flamegraph of the stress test:
+  - `scripts/flame-stress.sh [--dev-profile] [mode] [concurrency] [total] [outdir]`
+  - Modes: `enqueue` (default), `drain`, `mixed`.
+  - Examples:
+    - `scripts/flame-stress.sh` (defaults: 32, 2000, `flamegraphs/`)
+    - `scripts/flame-stress.sh 64 10000`
+  - The script sets `RUSTFLAGS="-C debuginfo=2 -C force-frame-pointers=yes -C lto=no -C codegen-units=1"` for better symbolization; on Linux it also passes `--no-inline`. Output path: `flamegraphs/flame-stress-<mode>-<conc>-<total>-<timestamp>.svg`.
+  - If symbols still look incomplete:
+    - Use debug profile: `cargo flamegraph --dev --test stress_tests -- --ignored <name>`
+    - Ensure binaries aren’t stripped; keep frame pointers.
+  - To force dev profile via script, pass `--dev-profile` as the first argument:
+    - `scripts/flame-stress.sh --dev-profile mixed 32 2000`

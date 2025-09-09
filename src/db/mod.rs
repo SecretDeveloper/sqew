@@ -1,6 +1,8 @@
 use crate::models::{Message, Queue};
 use anyhow::Context;
 use sqlx::{Executor, Sqlite, SqlitePool, Transaction};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use std::str::FromStr;
 use std::path::Path;
 use std::{env, fs};
 // Embedded initial SQL schema for bootstrapping a new database
@@ -159,55 +161,77 @@ pub async fn poll_messages(
     limit: i64,
     visibility_ms: i64,
 ) -> sqlx::Result<Vec<Message>> {
-    let mut tx: Transaction<'_, Sqlite> = pool.begin().await?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    let ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT m.id
-         FROM message m
-         WHERE m.queue_id = (SELECT id FROM queue WHERE name = ?)
-           AND m.available_at <= ?
-         ORDER BY m.available_at, m.id
-         LIMIT ?",
-    )
-    .bind(queue_name)
-    .bind(now)
-    .bind(limit)
-    .fetch_all(&mut *tx)
-    .await?;
+    // Retry loop to mitigate SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT under contention
+    let mut attempt = 0u32;
+    loop {
+        let res: sqlx::Result<Vec<Message>> = async {
+            let mut tx: Transaction<'_, Sqlite> = pool.begin().await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT m.id
+                 FROM message m
+                 WHERE m.queue_id = (SELECT id FROM queue WHERE name = ?)
+                   AND m.available_at <= ?
+                 ORDER BY m.available_at, m.id
+                 LIMIT ?",
+            )
+            .bind(queue_name)
+            .bind(now)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
 
-    if ids.is_empty() {
-        tx.commit().await?;
-        return Ok(Vec::new());
-    }
+            if ids.is_empty() {
+                tx.commit().await?;
+                return Ok(Vec::new());
+            }
 
-    let new_available = now + visibility_ms.max(0);
-    let placeholders =
-        std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
-    let update_sql = format!(
-        "UPDATE message SET available_at = ? WHERE id IN ({})",
-        placeholders
-    );
-    let mut uq = sqlx::query(&update_sql).bind(new_available);
-    for id in &ids {
-        uq = uq.bind(id);
-    }
-    uq.execute(&mut *tx).await?;
+            let new_available = now + visibility_ms.max(0);
+            let placeholders =
+                std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+            let update_sql = format!(
+                "UPDATE message SET available_at = ? WHERE id IN ({})",
+                placeholders
+            );
+            let mut uq = sqlx::query(&update_sql).bind(new_available);
+            for id in &ids {
+                uq = uq.bind(id);
+            }
+            uq.execute(&mut *tx).await?;
 
-    let select_sql = format!(
-        "SELECT id, queue_id, payload, attempts, available_at, created_at
-         FROM message WHERE id IN ({}) ORDER BY available_at, id",
-        placeholders
-    );
-    let mut sq = sqlx::query_as::<_, Message>(&select_sql);
-    for id in &ids {
-        sq = sq.bind(id);
+            let select_sql = format!(
+                "SELECT id, queue_id, payload, attempts, available_at, created_at
+                 FROM message WHERE id IN ({}) ORDER BY available_at, id",
+                placeholders
+            );
+            let mut sq = sqlx::query_as::<_, Message>(&select_sql);
+            for id in &ids {
+                sq = sq.bind(id);
+            }
+            let messages = sq.fetch_all(&mut *tx).await?;
+            tx.commit().await?;
+            Ok(messages)
+        }
+        .await;
+
+        match res {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("database is locked") && attempt < 200 {
+                    // brief backoff then retry
+                    let delay_ms = 5 * (attempt + 1).min(50);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms as u64)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
     }
-    let messages = sq.fetch_all(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(messages)
 }
 
 /// Count ready messages (available and not leased or lease expired)
@@ -259,9 +283,22 @@ pub async fn init_pool() -> anyhow::Result<SqlitePool> {
 /// Initialize the SQLite connection pool at a specific path.
 pub async fn init_pool_at(path: &Path) -> anyhow::Result<SqlitePool> {
     let db_url = format!("sqlite://{}", path.to_string_lossy());
-    let pool = SqlitePool::connect(&db_url)
+    // Configure SQLite for better concurrency under load
+    let connect_opts = SqliteConnectOptions::from_str(&db_url)
+        .context("Invalid SQLite URL")?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(32)
+        .connect_with(connect_opts)
         .await
         .context("Failed to connect to the database")?;
+    // Set WAL autocheckpoint to a reasonable value
+    sqlx::query("PRAGMA wal_autocheckpoint = 1000;")
+        .execute(&pool)
+        .await
+        .ok();
     Ok(pool)
 }
 
